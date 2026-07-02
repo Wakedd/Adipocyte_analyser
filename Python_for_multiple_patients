@@ -1,0 +1,333 @@
+import os
+import glob
+import time
+import zipfile
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from cellpose import models, io
+from aicspylibczi import CziFile
+from skimage.measure import regionprops
+from skimage.segmentation import find_boundaries, clear_border, relabel_sequential
+from skimage.color import gray2rgb
+
+# ==========================================================
+# 1. BATCH CALIBRATION & CONFIGURATION (FULLY AUTOMATED)
+# ==========================================================
+DENSITY_G_ML = 0.916
+TARGET_CELL_DIAMETER_UM = 200
+CELLPROB_THRESHOLD = 0.0
+FLOW_THRESHOLD = 0.25
+DIAMETER_SOURCE = "area"
+VOLUME_UNIT = "um3"
+WEIGHT_UNIT = "ug"
+
+
+# ==========================================================
+# 2. HELPER FUNCTIONS
+# ==========================================================
+def get_czi_scale(czi_object):
+    """Extracts the precise X scaling factor (microns/pixel) from CZI XML metadata."""
+    try:
+        root = czi_object.meta
+        scaling_element = root.find(".//Distance[@Id='X']/Value")
+        if scaling_element is not None:
+            scale_in_meters = float(scaling_element.text)
+            return round(scale_in_meters * 1e6, 4)
+    except Exception as e:
+        print(f"   ⚠️ Metadata read failed: {e}")
+    return None
+
+def enhance_contrast_fiji_style(img, saturation_percent=0.35):
+    """Mimics Fiji's 'Enhance Contrast' (saturated=0.35) and forces 8-bit grayscale."""
+    low_val = np.percentile(img, saturation_percent)
+    high_val = np.percentile(img, 100.0 - saturation_percent)
+    clipped = np.clip(img, low_val, high_val)
+    if high_val - low_val > 0:
+        normalized = (clipped - low_val) / (high_val - low_val) * 255.0
+    else:
+        normalized = clipped * 0
+    return normalized.astype(np.uint8)
+
+
+print("Loading Cellpose model onto the cloud GPU...")
+model = models.CellposeModel(gpu=True, pretrained_model='cyto3')
+
+# ==========================================================
+# 3. FIND ALL PATIENT SUBFOLDERS
+# ==========================================================
+# Scans the current working directory for subfolders (one per patient)
+all_subfolders = sorted([
+    d for d in os.listdir(".")
+    if os.path.isdir(d) and not d.startswith(".")
+])
+
+print(f"\nFound {len(all_subfolders)} patient folder(s): {all_subfolders}")
+
+# Collect all output files for final ZIP, grouped by patient folder
+all_output_files = {}
+
+# ==========================================================
+# 4. OUTER LOOP — ONE ITERATION PER PATIENT FOLDER
+# ==========================================================
+for patient_folder in all_subfolders:
+    print(f"\n{'='*60}")
+    print(f"📂 Processing patient folder: {patient_folder}")
+    print(f"{'='*60}")
+
+    image_files = sorted(glob.glob(os.path.join(patient_folder, "*.czi")))
+
+    if not image_files:
+        print(f"   ⚠️ No .czi files found in '{patient_folder}', skipping.")
+        continue
+
+    print(f"   Found {len(image_files)} .czi file(s).")
+    all_cell_data = []
+
+    # ==========================================================
+    # 5. INNER LOOP — ONE ITERATION PER IMAGE
+    # ==========================================================
+    for idx, img_path in enumerate(image_files, 1):
+        print(f"\n   [{idx}/{len(image_files)}] Processing: {os.path.basename(img_path)}")
+        try:
+            start_time = time.time()
+
+            # A. Open CZI and extract dynamic image scale
+            czi = CziFile(img_path)
+            current_scale = get_czi_scale(czi)
+
+            if current_scale is None:
+                print(f"   ⚠️ Uncalibrated CZI metadata! Skipping {img_path}.")
+                continue
+            print(f"   📊 Scale: {current_scale} µm/pixel")
+
+            # B. Automatically calculate pixel diameter for Cellpose
+            calculated_pixel_diameter = int(TARGET_CELL_DIAMETER_UM / current_scale)
+            calculated_min_size = max(20, int(calculated_pixel_diameter * 0.7))
+            print(f"   🧠 Diameter: {calculated_pixel_diameter} px | Min Size: {calculated_min_size} px")
+
+            # C. Read and preprocess the image
+            img_data, _ = czi.read_image(S=0, C=0, Z=0, T=0)
+            img_2d = np.squeeze(img_data)
+            img = enhance_contrast_fiji_style(img_2d, saturation_percent=0.35)
+
+            # D. Run segmentation
+            result = model.eval(
+                img,
+                diameter=calculated_pixel_diameter,
+                min_size=calculated_min_size,
+                cellprob_threshold=CELLPROB_THRESHOLD,
+                flow_threshold=FLOW_THRESHOLD,
+                channels=[0, 0]
+            )
+
+            if len(result) == 4:
+                masks, flows, styles, diams = result
+            else:
+                masks, flows, styles = result
+
+            # E. Remove edge-touching cells
+            cells_before = len(np.unique(masks)) - 1
+            masks = clear_border(masks)
+            cells_after = len(np.unique(masks)) - 1
+            print(f"   🚫 Removed {cells_before - cells_after} edge-touching cell(s).")
+
+            # F. Relabel sequentially from 1
+            masks, _, _ = relabel_sequential(masks)
+
+            print(f"   -> Segmentation finished in {time.time() - start_time:.2f}s")
+
+            # G. Generate outlines (always true grayscale to avoid blue tint)
+            img_gray = img if img.ndim == 2 else img[:, :, 0]
+            img_outlines = gray2rgb(img_gray)
+            boundaries = find_boundaries(masks, mode='inner')
+            img_outlines[boundaries] = [0, 255, 0]
+
+            # H. Extract measurements
+            props = regionprops(masks)
+            print(f"   -> Identified {len(props)} cells.")
+
+            fig, ax = plt.subplots(figsize=(18, 18))
+            ax.imshow(img_outlines)
+
+            for cell in props:
+                y, x = cell.centroid
+                raw_area_pixels = cell.area
+
+                max_caliper_um = cell.major_axis_length * current_scale
+                min_caliper_um = cell.minor_axis_length * current_scale
+                caliper_diameter_um = (max_caliper_um + min_caliper_um) / 2
+
+                raw_area_um2 = raw_area_pixels * (current_scale ** 2)
+                area_diameter_um = 2 * np.sqrt(raw_area_um2 / np.pi)
+
+                chosen_diameter_um = caliper_diameter_um if DIAMETER_SOURCE == "caliper" else area_diameter_um
+                radius_um = chosen_diameter_um / 2
+
+                projected_area_um2 = np.pi * (radius_um ** 2)
+                sphere_surface_area_3D_um2 = 4 * np.pi * (radius_um ** 2)
+                volume_um3 = (4.0 / 3.0) * np.pi * (radius_um ** 3)
+                weight_pg = volume_um3 * DENSITY_G_ML
+
+                if VOLUME_UNIT == "mL":
+                    volume_display = volume_um3 * 1e-12
+                    v_round = 14
+                else:
+                    volume_display = volume_um3
+                    v_round = 2
+
+                if WEIGHT_UNIT == "g":
+                    weight_display = weight_pg * 1e-12
+                    w_round = 14
+                elif WEIGHT_UNIT == "ug":
+                    weight_display = weight_pg * 1e-6
+                    w_round = 8
+                elif WEIGHT_UNIT == "ng":
+                    weight_display = weight_pg * 1e-3
+                    w_round = 5
+                else:
+                    weight_display = weight_pg
+                    w_round = 2
+
+                all_cell_data.append({
+                    "Image_Name": os.path.basename(img_path),
+                    "Scale_Used_um_per_px": current_scale,
+                    "Cell_ID": int(cell.label),
+                    "Raw_Area_Pixels": raw_area_pixels,
+                    "Projected_Area_2D_um2": round(projected_area_um2, 2),
+                    "Sphere_Surface_Area_3D_um2": round(sphere_surface_area_3D_um2, 2),
+                    "Diameter_From_Area_um": round(area_diameter_um, 2),
+                    "Diameter_From_Caliper_um": round(caliper_diameter_um, 2),
+                    "Selected_Diameter_um": round(chosen_diameter_um, 2),
+                    f"Volume_{VOLUME_UNIT}": round(volume_display, v_round),
+                    f"Weight_{WEIGHT_UNIT}": round(weight_display, w_round),
+                    "Max_Caliper_Width_um": round(max_caliper_um, 2),
+                    "Min_Caliper_Width_um": round(min_caliper_um, 2)
+                })
+
+                ax.text(x, y, str(cell.label), color="yellow", fontsize=6, weight="bold",
+                        ha="center", va="center",
+                        bbox=dict(facecolor='black', alpha=0.5, edgecolor='none', pad=0.2))
+
+            ax.axis('off')
+            basename = os.path.splitext(os.path.basename(img_path))[0]
+            output_img_path = f"{patient_folder}_{basename}_labels.png"
+            plt.savefig(output_img_path, bbox_inches='tight', dpi=300)
+            plt.close()
+            all_output_files.setdefault(patient_folder, []).append(output_img_path)
+            print(f"   -> Saved annotated image: {output_img_path}")
+
+        except Exception as e:
+            print(f"   ❌ Error on {os.path.basename(img_path)}: {e}")
+
+    # ==========================================================
+    # 6. COMPILE CSV & DISTRIBUTION PLOT FOR THIS PATIENT
+    # ==========================================================
+    output_csv = f"{patient_folder}_cell_measurements.csv"
+    output_plot = f"{patient_folder}_batch_distribution_summary.png"
+
+    if all_cell_data:
+        df = pd.DataFrame(all_cell_data)
+        vol_col = f"Volume_{VOLUME_UNIT}"
+        weight_col = f"Weight_{WEIGHT_UNIT}"
+
+        numeric_cols = [
+            "Raw_Area_Pixels", "Projected_Area_2D_um2", "Sphere_Surface_Area_3D_um2",
+            "Diameter_From_Area_um", "Diameter_From_Caliper_um", "Selected_Diameter_um",
+            vol_col, weight_col, "Max_Caliper_Width_um", "Min_Caliper_Width_um"
+        ]
+
+        means = df[numeric_cols].mean()
+        stds = df[numeric_cols].std()
+
+        print(f"\n📊 Generating distribution dashboard for {patient_folder}...")
+        fig, axes = plt.subplots(2, 2, figsize=(15, 11))
+        fig.suptitle(f"Batch Morphological Frequency Distributions — {patient_folder}",
+                     fontsize=16, weight="bold", y=0.96)
+        colors = ["#3498db", "#2ecc71", "#e67e22", "#9b59b6"]
+
+        axes[0, 0].hist(df["Diameter_From_Area_um"], bins=15, color=colors[0], edgecolor="black", alpha=0.75)
+        axes[0, 0].axvline(means["Diameter_From_Area_um"], color="red", linestyle="--", linewidth=2,
+                           label=f"Mean: {means['Diameter_From_Area_um']:.2f} µm")
+        axes[0, 0].set_title("Diameter From Area Distribution", weight="bold")
+        axes[0, 0].set_xlabel("Diameter From Area (µm)")
+        axes[0, 0].set_ylabel("Cell Count (Frequency)")
+        axes[0, 0].grid(axis="y", linestyle=":", alpha=0.6)
+        axes[0, 0].legend()
+
+        axes[0, 1].hist(df["Sphere_Surface_Area_3D_um2"], bins=15, color=colors[1], edgecolor="black", alpha=0.75)
+        axes[0, 1].axvline(means["Sphere_Surface_Area_3D_um2"], color="red", linestyle="--", linewidth=2,
+                           label=f"Mean: {means['Sphere_Surface_Area_3D_um2']:.1f} µm²")
+        axes[0, 1].set_title("Sphere Surface Area 3D Distribution", weight="bold")
+        axes[0, 1].set_xlabel("Surface Area (µm²)")
+        axes[0, 1].set_ylabel("Cell Count (Frequency)")
+        axes[0, 1].grid(axis="y", linestyle=":", alpha=0.6)
+        axes[0, 1].legend()
+
+        axes[1, 0].hist(df[vol_col], bins=15, color=colors[2], edgecolor="black", alpha=0.75)
+        axes[1, 0].axvline(means[vol_col], color="red", linestyle="--", linewidth=2,
+                           label=f"Mean: {means[vol_col]:.2f} {VOLUME_UNIT}")
+        axes[1, 0].set_title(f"Volume Distribution ({VOLUME_UNIT})", weight="bold")
+        axes[1, 0].set_xlabel(f"Volume ({VOLUME_UNIT})")
+        axes[1, 0].set_ylabel("Cell Count (Frequency)")
+        axes[1, 0].grid(axis="y", linestyle=":", alpha=0.6)
+        axes[1, 0].legend()
+
+        axes[1, 1].hist(df[weight_col], bins=15, color=colors[3], edgecolor="black", alpha=0.75)
+        axes[1, 1].axvline(means[weight_col], color="red", linestyle="--", linewidth=2,
+                           label=f"Mean: {means[weight_col]:.6f} {WEIGHT_UNIT}")
+        axes[1, 1].set_title(f"Weight Distribution ({WEIGHT_UNIT})", weight="bold")
+        axes[1, 1].set_xlabel(f"Weight ({WEIGHT_UNIT})")
+        axes[1, 1].set_ylabel("Cell Count (Frequency)")
+        axes[1, 1].grid(axis="y", linestyle=":", alpha=0.6)
+        axes[1, 1].legend()
+
+        plt.tight_layout(rect=[0, 0.02, 1, 0.93])
+        plt.savefig(output_plot, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"   -> Dashboard saved: {output_plot}")
+
+        mean_row = {col: round(means[col], 8 if "ug" in col else (5 if "ng" in col else (14 if "g" in col or "mL" in col else 2))) for col in numeric_cols}
+        mean_row["Image_Name"] = "=== BATCH MEAN ==="
+        mean_row["Cell_ID"] = ""
+        mean_row["Scale_Used_um_per_px"] = ""
+
+        std_row = {col: round(stds[col], 8 if "ug" in col else (5 if "ng" in col else (14 if "g" in col or "mL" in col else 2))) for col in numeric_cols}
+        std_row["Image_Name"] = "=== BATCH STD DEV ==="
+        std_row["Cell_ID"] = ""
+        std_row["Scale_Used_um_per_px"] = ""
+
+        empty_row = {col: "" for col in df.columns}
+        df_summary = pd.DataFrame([empty_row, mean_row, std_row])
+        df_final = pd.concat([df, df_summary], ignore_index=True)
+        df_final.to_csv(output_csv, index=False)
+        print(f"🎉 {patient_folder} complete — {len(all_cell_data)} cells written to '{output_csv}'")
+
+        all_output_files.setdefault(patient_folder, []).append(output_csv)
+        all_output_files.setdefault(patient_folder, []).append(output_plot)
+    else:
+        print(f"\n⚠️ No cells detected for {patient_folder}.")
+
+# ==========================================================
+# 7. PACKAGE EVERYTHING INTO ONE ZIP
+# ==========================================================
+print("\n📦 Packaging all outputs into a single ZIP file...")
+zip_filename = "cellpose_analysis_results.zip"
+
+with zipfile.ZipFile(zip_filename, 'w') as target_zip:
+    for patient_folder, files in all_output_files.items():
+        for f in files:
+            if os.path.exists(f):
+                # Write into a subfolder named after the patient
+                arcname = os.path.join(patient_folder, os.path.basename(f))
+                target_zip.write(f, arcname=arcname)
+                print(f"   -> Added: {arcname}")
+
+print(f"   -> Archive created: '{zip_filename}'")
+
+try:
+    from google.colab import files
+    print("📥 Triggering automatic download...")
+    files.download(zip_filename)
+except ImportError:
+    print(f"\n💡 Right-click '{zip_filename}' in the sidebar and select Download.")
