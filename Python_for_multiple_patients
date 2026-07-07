@@ -1,6 +1,7 @@
 import os
 import glob
 import time
+import shutil
 import zipfile
 import numpy as np
 import pandas as pd
@@ -49,6 +50,20 @@ def enhance_contrast_fiji_style(img, saturation_percent=0.35):
         normalized = clipped * 0
     return normalized.astype(np.uint8)
 
+
+# ==========================================================
+# MOUNT GOOGLE DRIVE — results saved here after each patient
+# so a crash mid-run doesn't lose completed work
+# ==========================================================
+try:
+    from google.colab import drive
+    drive.mount('/content/drive')
+    DRIVE_OUTPUT_FOLDER = "/content/drive/MyDrive/Adipocyte_Analyser_Results"
+    os.makedirs(DRIVE_OUTPUT_FOLDER, exist_ok=True)
+    print(f"✅ Google Drive mounted. Results will be saved to: {DRIVE_OUTPUT_FOLDER}")
+except ImportError:
+    DRIVE_OUTPUT_FOLDER = None
+    print("⚠️ Not running in Colab — Drive saving disabled.")
 
 print("Loading Cellpose model onto the cloud GPU...")
 model = models.CellposeModel(gpu=True, pretrained_model='cyto3')
@@ -305,6 +320,16 @@ for patient_folder in all_subfolders:
 
         all_output_files.setdefault(patient_folder, []).append(output_csv)
         all_output_files.setdefault(patient_folder, []).append(output_plot)
+
+        # ✅ SAVE TO GOOGLE DRIVE IMMEDIATELY after each patient completes
+        # This protects results if Colab times out mid-run
+        if DRIVE_OUTPUT_FOLDER:
+            patient_drive_folder = os.path.join(DRIVE_OUTPUT_FOLDER, patient_folder)
+            os.makedirs(patient_drive_folder, exist_ok=True)
+            for f in all_output_files[patient_folder]:
+                if os.path.exists(f):
+                    shutil.copy(f, os.path.join(patient_drive_folder, os.path.basename(f)))
+            print(f"💾 Results for '{patient_folder}' saved to Google Drive.")
     else:
         print(f"\n⚠️ No cells detected for {patient_folder}.")
 
